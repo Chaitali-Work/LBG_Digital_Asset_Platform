@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Buy TESTUSD</title>
+</head>
+<body>
+  <h2>Buy TESTUSD Stablecoin</h2>
+  <form id="payment-form">
+    <label for="wallet">Your Wallet Address:</label>
+    <input type="text" id="wallet" name="wallet" required />
+    <button type="submit">Buy $10 worth of TESTUSD</button>
+  </form>
+
+  <script>
+    document.getElementById("payment-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const walletAddress = document.getElementById("wallet").value;
+
+      const response = await fetch("/create-checkout-session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ walletAddress })
+      });
+
+      const session = await response.json();
+      window.location.href = session.url;
+    });
+  </script>
+</body>
+</html>
