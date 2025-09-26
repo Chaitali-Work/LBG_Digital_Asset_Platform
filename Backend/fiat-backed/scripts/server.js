@@ -91,84 +91,6 @@ app.get('/balance_stable_coin/:address', async (req, res) => {
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
-app.post("/create_checkout_session", async (req, res) => {
-    const { walletAddress, amount } = req.body;
-    try {
-        const session = await stripe.checkout.sessions.create({
-            payment_method_types: ["card"],
-            line_items: [{
-                price_data: {
-                    currency: "usd",
-                    product_data: { name: "Deposit USD for TUSD" },
-                    unit_amount: amount * 100, // Stripe uses cents
-                },
-                quantity: 1,
-            }],
-            mode: "payment",
-            success_url: "http://localhost:4242/success",
-            cancel_url: "http://localhost:4242/cancel",
-            metadata: {
-                wallet: walletAddress,
-                amount: amount.toString()
-            },
-        });
-        res.json({ sessionId: session.id });
-    } catch (error) {
-        console.error("Error creating Stripe session:", error);
-        res.status(500).send("Stripe session creation failed");
-    }
-});
-
-app.get("/checkout_url/:sessionId", async (req, res) => {
-    try {
-        const session = await stripe.checkout.sessions.retrieve(req.params.sessionId);
-        res.json({ url: session.url });
-    } catch (error) {
-        console.error("Error retrieving session URL:", error);
-        res.status(500).send("Failed to retrieve session URL");
-    }
-});
-
-app.post("/webhook", async (req, res) => {
-    const sig = req.headers["stripe-signature"];
-    let event;
-    try {
-        event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-    } catch (err) {
-        console.error("Webhook signature verification failed:", err.message);
-        return res.sendStatus(400);
-    }
-    if (event.type === "checkout.session.completed") {
-        const session = event.data.object;
-        const wallet = session.metadata.wallet;
-        const amount = session.metadata.amount;
-
-        try {
-            const adminAddress = '0xfe3b557e8fb62b89f4916b721be55ceb828dbd73';
-            const adminPrivateKey = addressToPrivateKey[adminAddress];
-            const adminWallet = new ethers.Wallet(adminPrivateKey, provider);
-            const contract = new ethers.Contract(stableCoinAddress, stableCoinAbi, adminWallet);
-
-            const tx = await contract.mint(wallet, amount);
-            await tx.wait();
-            console.log(`Minted ${amount} TUSD to ${wallet}`);
-        } catch (err) {
-            console.error("Error minting after Stripe payment:", err);
-        }
-    }
-    res.sendStatus(200);
-});
-
-app.get("/success", (req, res) => {
-    res.send("<h1>Payment successful!</h1>");
-});
-
-app.get("/cancel", (req, res) => {
-    res.send("<h1>Payment cancelled.</h1>");
-});
-
-/*-----------*/
-
 app.post("/create_express_account", async (req, res) => {
     const { email } = req.body;
     try {
@@ -195,7 +117,7 @@ app.post("/generate_onboarding_link", async (req, res) => {
         const accountLink = await stripe.accountLinks.create({
             account: connectedAccountId,
             refresh_url: "http://localhost:4242/reauth",
-            return_url: "http://localhost:4242/onboarding_complete",
+            return_url: `http://localhost:4242/onboarding_complete?accountId=${connectedAccountId}`,
             type: "account_onboarding"
         });
         res.json({ onboardingUrl: accountLink.url });
@@ -205,40 +127,23 @@ app.post("/generate_onboarding_link", async (req, res) => {
     }
 });
 
-app.get("/onboarding_complete", (req, res) => {
-    res.send("<h1>User onboarded successfully!</h1>");
+app.get("/onboarding_complete", async (req, res) => {
+    const connectedAccountId = req.query.accountId;
+
+    const walletDoc = await db.collection("walletPool").findOne({});
+    const walletAddress = walletDoc.walletAddress;
+
+    await db.collection("bindings").insertOne({
+        connectedAccountId,
+        walletAddress
+    });
+
+    await db.collection("walletPool").deleteOne({ walletAddress });
+
+    res.send(`<h4>User onboarded successfully</h4>`);
 });
 
-app.post("/get_stripe_balances", async (req, res) => {
-    const { connectedAccountId } = req.body;
-    try {
-        // Fetch balance for connected account (e.g., Alice Smith)
-        const userBalance = await stripe.balance.retrieve({
-            stripeAccount: connectedAccountId
-        });
-
-        //Fetch balance for platform account (Custodian)
-        const custodianBalance = await stripe.balance.retrieve();
-
-        res.json({
-            connectedAccount: {
-                id: connectedAccountId,
-                available: userBalance.available,
-                // pending: userBalance.pending
-            },
-            custodianAccount: {
-                id: process.env.CUSTODIAN_STRIPE_ACCOUNT_ID,
-                available: custodianBalance.available,
-                // pending: custodianBalance.pending
-            }
-        });
-    } catch (error) {
-        console.error("Error fetching balances:", error);
-        res.status(500).send("Failed to retrieve balances");
-    }
-});
-
-app.post("/new_create_checkout_session", async (req, res) => {
+app.post("/create_checkout_session", async (req, res) => {
     const { connectedAccountId, amount } = req.body;
     try {
         const session = await stripe.checkout.sessions.create({
@@ -270,8 +175,12 @@ app.post("/new_create_checkout_session", async (req, res) => {
     }
 });
 
+app.get("/success", (req, res) => {
+    res.send("<h4>Funded successfully</h4>")
+})
+
 app.post("/transfer_to_custodian", async (req, res) => {
-    const { connectedAccountId, walletAddress, amount } = req.body;
+    const { connectedAccountId, amount } = req.body;
     try {
         const transfer = await stripe.transfers.create(
             {
@@ -283,56 +192,91 @@ app.post("/transfer_to_custodian", async (req, res) => {
                 stripeAccount: connectedAccountId
             }
         );
-        console.log(`${connectedAccountId} has made a payment of £${amount}`);
 
-        const walletPrivateKey = addressToPrivateKey[walletAddress];
-        const userWallet = new ethers.Wallet(walletPrivateKey, provider);
-        const contract = new ethers.Contract(stableCoinAddress, stableCoinAbi, userWallet);
-
-        const tx = await contract.mint(walletAddress, amount);
-        const receipt = await tx.wait();
-        console.log(`Minted ${amount} TGBP to ${walletAddress}`);
-
-        const connectedAccount = await stripe.accounts.retrieve(connectedAccountId);
-        const userEmail = connectedAccount.email;
-
-        let tokenAmount = null;
-        for (const log of receipt.logs) {
-
-            try {
-                const parsedLog = contract.interface.parseLog(log);
-                if (parsedLog.name === "Minted") {
-                    tokenAmount = parsedLog.args.tokenAmount;
-                    break;
-                }
-            } catch (err) {
-                continue;
-            }
-        }
-
-        await db.collection("mintLogs").insertOne({
-            email: userEmail,
-            connectedAccountId,
-            amount,
-            transferId: transfer.id,
-            walletAddress,
-            tokenAmount: tokenAmount,
-            txHash: tx.hash
-        })
+        console.log(`${connectedAccountId} has made a payment of £${amount} GBP`);
 
         res.json({
-            transferId: transfer.id,
-            txHash: tx.hash,
-            message: "Transaction successful"
+            transferId: transfer.id
         });
+
     } catch (error) {
         console.error("Error:", error);
         res.status(500).send("Transaction failed");
     }
 });
 
+app.post("/webhook", async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    let event;
+    try {
+        event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+        console.error("Webhook signature verification failed:", err.message);
+        return res.sendStatus(400);
+    }
+    if (event.type === "payment.created") {
+        const payment = event.data.object;
+
+        if (payment.status === "succeeded" && payment.source_transfer) {
+            const connectedAccountId = payment.source.id;
+            const amount = payment.amount / 100;
+
+            const account = await stripe.accounts.retrieve(connectedAccountId);
+            const email = account.email;
+
+            const binding = await db.collection("bindings").findOne({ connectedAccountId });
+
+            if (!binding || !binding.walletAddress) {
+                console.warn('----------------------');
+                return res.status(200).send('No wallet found');
+            }
+
+            try {
+                const walletAddress = binding.walletAddress;
+                const walletPrivateKey = addressToPrivateKey[walletAddress];
+                const userWallet = new ethers.Wallet(walletPrivateKey, provider);
+                const contract = new ethers.Contract(stableCoinAddress, stableCoinAbi, userWallet);
+
+                const tx = await contract.mint(walletAddress, amount);
+                const receipt = await tx.wait();
+
+                let tokenAmount = null;
+                for (const log of receipt.logs) {
+
+                    try {
+                        const parsedLog = contract.interface.parseLog(log);
+                        if (parsedLog.name === "Minted") {
+                            tokenAmount = parsedLog.args.tokenAmount;
+                            break;
+                        }
+                    } catch (err) {
+                        continue;
+                    }
+                }
+
+                await db.collection("mintLogs").insertOne({
+                    email: email,
+                    connectedAccountId,
+                    amount,
+                    transferId: payment.source_transfer,
+                    walletAddress,
+                    tokenAmount: tokenAmount,
+                    txHash: tx.hash
+                });
+
+                console.log(`Minted ${amount} TGBP to ${walletAddress}`);
+
+            } catch (err) {
+                console.error("Minting failed:", err.message);
+            }
+
+        }
+    }
+    res.sendStatus(200);
+});
+
 app.post("/redeem", async (req, res) => {
-    const { connectedAccountId, walletAddress, amount } = req.body;
+    const { walletAddress, amount } = req.body;
     try {
 
         const walletPrivateKey = addressToPrivateKey[walletAddress];
@@ -358,6 +302,10 @@ app.post("/redeem", async (req, res) => {
             }
         }
 
+        const binding = await db.collection("bindings").findOne({ walletAddress });
+
+        const connectedAccountId = binding.connectedAccountId;
+
         const transfer = await stripe.transfers.create(
             {
                 amount: amount * 100,
@@ -366,24 +314,25 @@ app.post("/redeem", async (req, res) => {
                 description: `Redemption of ${amount} TGBP`
             }
         );
+
         console.log(`${connectedAccountId} has been paid back £${amount} GBP`);
 
-        const connectedAccount = await stripe.accounts.retrieve(connectedAccountId);
-        const userEmail = connectedAccount.email;
+        const account = await stripe.accounts.retrieve(connectedAccountId);
+        const email = account.email;
 
         await db.collection("burnLogs").insertOne({
-            email: userEmail,
-            connectedAccountId,
-            amount,
-            transferId: transfer.id,
             walletAddress,
             tokenAmount: tokenAmount,
-            txHash: tx.hash
+            txHash: tx.hash,
+            email: email,
+            connectedAccountId,
+            amount,
+            transferId: transfer.id
         })
 
         res.json({
-            transferId: transfer.id,
             txHash: tx.hash,
+            transferId: transfer.id,
             message: "Transaction successful"
         });
 
